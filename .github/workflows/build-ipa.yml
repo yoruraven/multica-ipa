@@ -1,0 +1,168 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream multica-ai/multica ref (tag, branch or SHA). Leave empty to use the latest upstream release."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 300
+    steps:
+      - name: Resolve upstream ref
+        id: ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            REF="$INPUT_REF"
+          else
+            REF="$(gh api repos/multica-ai/multica/releases/latest --jq .tag_name)"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Upstream ref: $REF"
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Checkout upstream multica
+        uses: actions/checkout@v4
+        with:
+          repository: multica-ai/multica
+          ref: ${{ steps.ref.outputs.ref }}
+          path: multica
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: multica/pnpm-lock.yaml
+
+      - name: Select newest Xcode
+        run: |
+          XCODE_APP="$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)"
+          echo "Selecting $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install dependencies
+        working-directory: multica
+        run: pnpm install --frozen-lockfile
+
+      # Mirror the official `ios:device:prod:release` environment:
+      # dotenv loads apps/mobile/.env.production, APP_ENV=production.
+      # Values are put into GITHUB_ENV so the later xcodebuild step inherits
+      # the EXPO_PUBLIC_* variables the RN bundle phase inlines.
+      - name: Load production env
+        working-directory: multica/apps/mobile
+        run: |
+          grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env.production >> "$GITHUB_ENV"
+          {
+            echo "APP_ENV=production"
+            echo "CI=1"
+            echo "EXPO_NO_TELEMETRY=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Expo prebuild (iOS)
+        working-directory: multica/apps/mobile
+        run: pnpm exec expo prebuild -p ios --no-install
+
+      - name: Install Pods
+        working-directory: multica/apps/mobile/ios
+        run: pod install
+
+      - name: Build unsigned .app (Release, iphoneos)
+        working-directory: multica/apps/mobile/ios
+        run: |
+          set -euo pipefail
+          WS="$(ls -d *.xcworkspace | head -n 1)"
+          PROJ_BASE="$(basename "$(ls -d *.xcodeproj | head -n 1)" .xcodeproj)"
+          SCHEMES="$(xcodebuild -workspace "$WS" -list -json | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["workspace"]["schemes"]))')"
+          if printf '%s\n' "$SCHEMES" | grep -qx "$PROJ_BASE"; then
+            SCHEME="$PROJ_BASE"
+          else
+            SCHEME="$(printf '%s\n' "$SCHEMES" | grep -v '^Pods' | head -n 1)"
+          fi
+          echo "Workspace: $WS"
+          echo "Scheme: $SCHEME"
+          xcodebuild \
+            -workspace "$WS" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/build" \
+            NODE_BINARY="$(command -v node)" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        id: ipa
+        working-directory: multica/apps/mobile/ios
+        env:
+          TAG: ${{ steps.ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -n 1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found under build/Build/Products/Release-iphoneos" >&2
+            exit 1
+          fi
+          echo "App bundle: $APP_PATH"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          IPA_NAME="multica-${TAG}-unsigned.ipa"
+          IPA_PATH="$GITHUB_WORKSPACE/$IPA_NAME"
+          rm -f "$IPA_PATH"
+          zip -qry "$IPA_PATH" Payload
+          ls -lh "$IPA_PATH"
+          echo "ipa_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+          echo "ipa_path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ipa.outputs.ipa_name }}
+          path: ${{ steps.ipa.outputs.ipa_path }}
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ref.outputs.ref }}
+          IPA_PATH: ${{ steps.ipa.outputs.ipa_path }}
+        run: |
+          REPO="${{ github.repository }}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$IPA_PATH" --clobber --repo "$REPO"
+          else
+            gh release create "$TAG" "$IPA_PATH" --repo "$REPO" \
+              --title "Multica $TAG — unsigned IPA for LiveContainer" \
+              --notes "Unofficial unsigned build of the Multica iOS app, built from https://github.com/multica-ai/multica@$TAG by GitHub Actions on a macOS runner (official production configuration, connects to api.multica.ai).
+
+          This IPA is **not code-signed** and cannot be installed the usual way. It is meant to be run with LiveContainer: https://github.com/LiveContainer/LiveContainer"
+          fi
+          gh release view "$TAG" --repo "$REPO" --json url --jq .url
