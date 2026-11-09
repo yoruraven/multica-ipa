@@ -1,6 +1,10 @@
 # multica-ipa
 
-Unofficial **unsigned** iOS builds of the [Multica](https://github.com/multica-ai/multica) app, packaged as `.ipa` files for [LiveContainer](https://github.com/LiveContainer/LiveContainer).
+[![Latest Release](https://img.shields.io/github/v/release/yoruraven/multica-ipa?label=Latest%20Release)](https://github.com/yoruraven/multica-ipa/releases/latest)
+
+**[⬇️ Download the latest unsigned IPA](https://github.com/yoruraven/multica-ipa/releases/latest)**
+
+Unofficial **unsigned** iOS builds of the [Multica](https://github.com/multica-ai/multica) app, packaged as `.ipa` files.
 
 ## What this is
 
@@ -8,13 +12,9 @@ Unofficial **unsigned** iOS builds of the [Multica](https://github.com/multica-a
 - This repo automates that build on GitHub Actions macOS runners and publishes the result to [Releases](../../releases): an **unsigned** IPA built from the official production configuration (connects to `api.multica.ai`, same as multica.ai on the web).
 - Source code comes from [multica-ai/multica](https://github.com/multica-ai/multica), checked out at the upstream release tag matching each release here. Nothing in the app is modified.
 
-## Important: unsigned
-
-The IPA is built with code signing disabled (`CODE_SIGNING_ALLOWED=NO`). It has **no signature and no provisioning profile**, so it **cannot be installed the usual way** (not via Xcode device install, TestFlight, or sideloaders that expect a signed app). It is meant to be imported into **LiveContainer**, which runs unsigned apps without an Apple ID or developer account.
-
 ## How builds happen
 
-`.github/workflows/build-ipa.yml` (manual `workflow_dispatch`):
+`.github/workflows/build-ipa.yml` (manual `workflow_dispatch`, plus a daily scheduled run that builds only when upstream publishes a new release):
 
 1. Resolves the upstream ref (input `ref`, or the latest multica-ai/multica release tag).
 2. Checks out upstream, installs the pnpm workspace, loads `apps/mobile/.env.production` with `APP_ENV=production`.
